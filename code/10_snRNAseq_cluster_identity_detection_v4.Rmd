@@ -1,0 +1,632 @@
+---
+title: "10_snRNAseq_cluster_identity_detection_v4"
+author: "Katie Prater and Kevin Green"
+date: "08/21/2024"
+output:
+  html_document:
+    df_print: paged
+params:
+  container: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(stringr)
+```
+# Jayadev Lab snRNAseq Pipeline
+
+## Cell Type identification using marker genes and plots
+
+### Update 08.21.2024: 
+When using brain data, includes the BICCN and other marker 
+genes from Prashant S. Emani et al. ,Single-cell genomics and regulatory 
+networks for 388 human brains.Science384,eadi5199(2024).
+DOI:10.1126/science.adi5199. 
+(https://github.com/gersteinlab/PsychENCODE_SingleCell_Integrative/blob/main/scRNA-seq%20Pipeline/Hybrid_subclass_markers.json)
+
+### R Markdown note:
+This is an R Markdown document. When you click the **Knit** button a document
+will be generated that includes both content as well as the output of any
+embedded R code chunks within the document.
+
+## Set the dataset that needs cluster identities.
+# You MUST edit this for your dataset to run properly!!!!
+```{r Setup}
+# Previous data file name: (give the name for the appopriate RDS/Rdata file)
+start_data <- "QCd_louvain_multi_clustered_harmony_ws_32pcs_harm_42uns.rdata"
+
+# Tissue type: (brain, blood) - organoid is considered brain-related
+tissue_type <- "brain"
+
+# Cell Type (organoid, unsorted, pu1, pbmcs):
+cell_subtype <- "unsorted"
+
+# # number of PCs
+# nPCs <- 25
+
+# Did you use Leiden as your clustering algorithm? (boolean):
+leiden_alg <- FALSE
+
+# Resolution chosen from previous clustering to use to label clusters:
+change_resolution <- "0.3"
+
+# Change output path if necessary, otherwise leave NULL
+change_output_path <- NULL
+
+# Change suffix if needed, otherwise leave NULL
+change_suffix <- NULL
+
+#__________________**DO NOT EDIT BELOW THIS LINE**___________________________
+```
+
+### Load in the data you specified:
+```{r Load_Data}
+# Document your code:
+print(paste("This is when this code was started:", Sys.time()))
+
+# Print which container is being used
+if (identical(params$container, "")) {
+  stop("The container number must be documented before rendering.
+       params= list(container = ###)")
+}
+print(paste("Container number", params$container, "was used"))
+
+# Load the normalized/batch corrected Seurat object saved before
+print(paste('Loading data', start_data, sep = " "))
+load(paste0("../data/r_files/", start_data))
+
+# Print container package versions, if changed from previous
+if (!identical(params$container, prev_container)) {
+  print("This code was run using:")
+  print(sessionInfo())
+  prev_container <- params$container
+}
+rm(params)
+
+# Ensure cell type variable is set properly
+if (!identical(cell_subtype, cell_type)) {
+  cell_type <- cell_subtype
+}
+
+if (!is.null(change_output_path)) {
+  outpath <- change_output_path
+  # Change output UMAPs folder
+  umaps_path <- change_path(paste0(outpath, "/umaps/"))
+  if (leiden_alg) {
+    umaps_path <- change_path(paste0(umaps_path, "leiden_clust/"))
+  } else {
+    umaps_path <- change_path(paste0(umaps_path, "louvain_multi_clust/"))
+  }
+  umaps_path <- change_path(paste0(umaps_path, nPCs, "pcs/"))
+}
+
+#Ensure resolution to be used is set properly.
+if (!is.null(change_resolution)) {
+  chose_resolution <- change_resolution
+}
+
+#Ensure suffix to be used is set properly.
+if (!is.null(change_suffix)) {
+  suffix <- change_suffix
+}
+```
+
+```{r Set_Directories}
+#Ensure paths are set for code:
+if (file.exists(outpath)) {
+  cat("Output directory path works!")
+} else {
+  cat("Output directory does not exist - creating")
+  dir.create(outpath)
+}
+
+# Number of participants/samples to process:
+numsubs <- length(samples)
+print(paste("Processing", numsubs, "samples", sep = " "))
+
+# Documentation:
+print(paste("This is where the project is:", normalizePath(projdir)))
+print(paste("This is where the sample files are:", normalizePath(sample_dir)))
+print(paste("This is where the data files will be saved:",
+             normalizePath(outpath)))
+```
+
+## Set functions up
+```{r Set_functions}
+
+# Make resolution name:
+res_name <- paste0(assay, "_snn_res.", chose_resolution)
+
+# Set cluster identities in Seurat object
+Idents(object = ss_data_norm) <- res_name
+
+# Make umap plot function
+plot_features <- function(genes, umap_name) {
+  plot1 <- FeaturePlot(ss_data_norm, 
+                       reduction = "umap", 
+                       features = genes,
+                       min.cutoff = 0)
+  print(plot1)
+  ggsave(filename = paste0(umaps_path, cell_type, umap_name,  nPCs, "_pcs_res.",
+                           chose_resolution, suffix, ".png"),
+         height = 7, width = 11, plot = plot1)
+}
+
+# Check if genes are in the SCT assay
+check_genes <- function(pattern){
+  str_subset(rownames(ss_data_norm@assays[[assay]]@scale.data),
+             paste0("^",pattern,"$"))
+}
+
+# Check whether feature genes are in the variable features of your data.
+list_features <- function(genes) {
+  feat_in_data <- lapply(genes, check_genes)
+  feat_in_data <- unique(as.vector(feat_in_data[lapply(feat_in_data, length) >0],
+                                   mode = "character"))
+}
+
+# Make function to make dot plots
+plot_dot_plot <- function(genes, plot_name) {
+  plot2 <- DotPlot(ss_data_norm, 
+                   features = feat_in_data,
+                   assay = assay) + RotatedAxis()
+  print(plot2)
+  ggsave(filename = paste0(umaps_path, cell_type, plot_name, nPCs, "_pcs_res.",
+                           chose_resolution, suffix, ".pdf"),
+         height = 7, width = 11, plot = plot2)
+}
+
+```
+
+## Use the given "tissue" and cell type" to determine which gene sets are used
+## in making plots of expression on the umap clusters for this dataset.
+```{r Cell_Identity_Maps}
+# Check to see whether the tissue is brain or blood, then determine what cell
+# types are being analyzed. Make umap gene expression plots accordingly.
+
+# Make mitochondrial expression plot for clusters
+plot8 <-  ggplot(ss_data_norm@meta.data,
+                 aes(color=levels(res_name),
+                     x=percent.mito,
+                     fill= levels(res_name))) +
+          geom_density(alpha = 0.2) +
+          scale_x_log10() +
+          theme_classic() +
+          xlab("% Mitochondrial Genes") +
+          ylab("Frequency") 
+print(plot8)
+
+if (identical(tissue_type, "brain")) {
+  print(paste("Tissue analyzed is brain-related."))
+  if (!cell_type %in% c("unsorted", "pu1", "organoid")) {
+    stop(cell_type, " is not associated with brain tissue")
+  }
+  print(paste("The cell-type being analyzed is", cell_type))
+  
+  # Make initial plot of generic brain cell-type specific genes
+  plot_features(c("PDGFRA", "COL9A1", "TMEM63A", "ST18", "LEF1", "ITIH5",
+                  "S100B", "FGFR3", "C3", "CD74", "CHD5", "GABRG2"),
+                "_general_gene_expression_umap_")
+  
+  # Plot known mglia markers
+  plot_features(c("C3", "CD74", "C1QB", "CX3CR1", "SPI1"),
+                "_mglia_gene_expression_umap_")
+  
+  # Plot post-synaptic markers
+  plot_features(c("GRIA1", "GRIN1", "GRIN2B"), 
+                  "_post-synaptic_markers_umap")
+  
+  # Plot general brain cell type markers
+  print("General brain cell type markers from the Allen Institute")
+  feature_genes <- c("SPI1", "C3", "CD74", "C1QB","TGFBR2", "CX3CR1", "CCR2",
+                      "CD163", "PF4", "MRC1", "GFAP", "S100B", "ALDH1L1", 
+                     "AQP4", "MAP2","RBFOX3", "GRIA1", "SATB2", "NRGN", 
+                     "SLC17A7", "GAD1", "GAD2", "GRIP2", "NES", "SOX2", "CALB2",
+                     "DCX", "NEUROD1", "PDGFRA", "COL9A1", "COL20A1", "SOX8", 
+                     "MYT1", "TMEM63A", "ST18", "LEF1", "ITIH5")
+  feat_in_data <- list_features(feature_genes)
+  plot_dot_plot(feat_in_data, "_general_gene_expression_cluster_dotplot_")
+  
+  plot3 <- DoHeatmap(ss_data_norm, 
+                      features = feat_in_data,
+                      assay = assay,
+                      raster = FALSE,
+                      hjust = 1,
+                      angle = 0)
+  print(plot3)
+  ggsave(filename = paste0(umaps_path, cell_type,
+                             "_general_gene_expression_cluster_heatmap_",  nPCs,
+                             "_pcs_res.", chose_resolution, suffix, ".pdf"),
+           height = 7, width = 11, plot = plot3)
+
+
+# Special plots for PU.1   
+  if (identical(cell_type, "pu1")) {
+
+    # Change assay to use all genes
+    assay <- "SCT"
+    
+    # Make dotplot of peripheral and central markers
+    feat_in_data <- list_features(c("SPI1", "C3", "CD74", "C1QB","TGFBR2",
+                                    "CX3CR1","CD3E", "CCL5", "CCR2"))
+    plot_dot_plot(feat_in_data, "_peripheral_expression_cluster_dotplot_")
+    
+    # Reset idents to assay defined above for feature plot
+    # Make resolution name:
+    res_name <- paste0(assay, "_snn_res.", chose_resolution)
+    
+    # Set cluster identities in Seurat object
+    Idents(object = ss_data_norm) <- res_name
+    
+    # Plot pvm markers and peripheral macrophage markers
+    plot_features(c("CD3E", "CCL5", "CCR2"), "_peripheral_expression_umap_")
+    plot_features(c("CD163", "PF4", "MRC1"), "_pvm_expression_umap_")
+    
+    
+# Special plots for unsorted datasets:
+  } else {
+    
+  # Excitatory Neuron subtypes:
+    print("Excitatory Neuron Subtypes:")
+    
+    # Layer 2/3 Excitatory Neuron markers
+    print("Making Layer 2/3 Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "CA10","FAM19A1", "LAMA2", "PTPRK",
+                      "CUX2", "KCNIP4", "CBLN2", "LDB2", "COL5A2", "CADPS2")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_2_3_Exneurons_dotplot_")
+    
+    # Layer 4 Excitatory Neurons
+    print("Making Layer 4 IT Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "RORB","RMST", "POU6F2", "CPNE4",
+                      "TSHZ2", "OTOGL", "LINCR-0002", "FSTL4", "DCC", "IL1RAPL2",
+                      "PTPRD", "SCHLAP1", "FAM19A1", "PLCH1")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_5_IT_Exneurons_dotplot_")
+    
+    # Layer 5 Intra-Telencephalic Excitatory Neurons
+    print("Making Layer 5 intra-telencephalic Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "CPNE4","IL1RAPL2", "CADPS2", "RORB",
+                      "TOX", "FOXP2", "RXFP1", "FSTL4", "EPHA3", "POU6F2", "PTPRK", 
+                      "CLSTN2", "HS3ST2", "ARHGAP15", "KCNIP4", "PDZRN4")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_5_IT_Exneurons_dotplot_")
+
+    # Layer 5 Extra-Telencephalic Excitatory Neurons
+    print("Making Layer 5 extra-telencephalic Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "FAM19A1","COL24A1", "COL5A2",
+                       "VAT1L", "NRP1", "PCSK6", "CBLN2", "PTCHD1-AS", "CLEC2L",
+                       "CABP1", "KCNN2", "LMO7", "HOMER1", "ESRRG", "GRM8", 
+                       "NRGN", "NRG1", "PEX5L", "TOX", "SLC35F3", "KCNIP4")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_5_ET_Exneurons_dotplot_")
+
+    # Layer 5/6 Near-projecting Excitatory Neurons
+    print("Making Layer 5/6 Near-Projecting Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "HTR2C","TSHZ2", "NPSR1-AS1",
+                       "LOC729732", "HS3ST4", "ITGA8", "ASIC2", "SORCS2", "TLE4",
+                       "CHN2", "CDH6", "TLL1", "GRM8", "CRYM", "COL12A1", 
+                       "OLFM3", "CPNE4", "TOX", "SEMA3E", "NXPH2", "SEMA5B", 
+                       "KIAA1456", "GRM3", "DPY19L1", "DIRAS2", "GHR", "MPP7", 
+                       "NPSR1", "ZNF385D", "ETV1", "LDB2", "FER1L6-AS2", "PCP4", 
+                       "FOXP2", "DOCK4", "LY86-AS1", "ATP2C2", "FGFR1", "CLSTN2")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_5_6_NP_Exneurons_dotplot_")
+                    
+    # Layer 6 IT Excitatory Neurons
+    print("Making Layer 6 Intra-Telencephalic Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "LOC105374971","CBLN2", 
+                       "LOC284930", "SLIT3", "PTPRK", "LOC101928964")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_6_IT_Exneurons_dotplot_")
+    
+    # Layer 6 Cortico-Thalamic Excitatory Neurons
+    print("Making Layer 6 Cortico-Thalamic Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "SEMA3E","MEIS2", 
+                       "ADAMTSL1", "HS3ST4", "TRPM3", "FOXP2", "SEMA5A",
+                       "EGFEM1P", "TLE4", "COL24A1", "DLC1", "ASIC2", "PDZRN4",
+                       "SV2B", "RALYL", "RYR3", "PEX5L", "LDB2", "ZFPM2", "PDE1A",
+                       "CLSTN2")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_6_CT_Exneurons_dotplot_")   
+
+    # Layer 6B Excitatory Neurons
+    print("Making Layer 6B Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "HS3ST4","TLE4", 
+                       "MARCH1", "ZFHX3", "PDZRN4", "NFIA", "ARPP21",
+                       "DLC1", "SEMA3A", "MDFIC", "KIAA1217", "SLIT3", "ZFPM2",
+                       "PCSK5", "LMO3", "RXFP1", "DPYD", "MLIP", "C10orf11", "FUT9",
+                       "FOXP2", "MEIS2", "CDH10", "ZBTB7C", "RALYL")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_6B_Exneurons_dotplot_")      
+
+    # Layer 6 IT Car3 Excitatory Neurons
+    print("Making Layer 6 Intra-Telencephalic Car3 Excitatory Neuron plot:")
+    feature_genes <- c("SLC17A7", "SATB2", "SV2B", "NTNG2","THEMIS", 
+                       "LOC105378486", "MCTP2", "SNTB1", "ITGB8", "LOC105370983",
+                       "GSG1L", "NWD2", "CADPS2", "TRPC5", "CA10", "DACH1",
+                       "KCNIP4", "ZNF804B", "ERC2", "PDE1A", "ARAP2", "SORBS2", "CUX1",
+                       "KCTD16", "CLSTN2", "TMEM132D", "UNC5C", "MGAT5", "AK5", 
+                       "RIT2", "PDZRN4", "TENM4", "GALNT14", "RGS12", "SPOCK1", 
+                       "PCDH9", "NRG1", "FRAS1", "CPNE4", "CTNNA3")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_layer_6_IT_Car3_Exneurons_dotplot_")      
+
+  # Inhibitory Neuron subtypes:
+    print("Inhibitory Neuron Subtypes:")
+        
+    # Lamp5 Inhibitory Neurons
+    print("Making Lamp5 Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "RELN", "LINC00299","PRELID2", 
+                       "CXCL14", "FGF13", "HS3ST5", "SV2C", "MYO16",
+                       "TRPC3", "FREM1", "CACNA2D1", "DOCK10", "EGFR", "ADARB2",
+                       "FSTL5", "KIT", "PTCHD4", "SLC6A1", "DNER", "NYAP2", "SGCZ",
+                       "LOC101927870", "CNTNAP4", "EYA4", "FBXL7", "ALK", "INPP4B", 
+                       "NRG1", "COL5A2")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_Lamp5_Inh_Neurons_dotplot_")  
+    
+    # Lamp5 Lhx6 Inhibitory Neurons
+    print("Making Lamp5 Lhx6 Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "FGF13", "PDGFD","EYA4", 
+                       "NTNG1", "CHST9", "FBXL7", "MYO16", "UNC5D",
+                       "GRIA4", "TOX", "SV2C", "LAMP5", "LTBP1", "LINC00403",
+                       "LINC00299", "VAV3", "NOS1", "CA1", "CA8", "KIT", "SFRP1",
+                       "COL4A2", "LINC01314", "TACR1", "CDHR3", "CACNA2D1", "SPHKAP", 
+                       "ALK", "IGSF11", "RAB3IP", "PTCHD4", "GRIN2A", "SLC6A1", 
+                       "UNC13C", "ZNF536", "PTPRT", "GRIP1", "NFIB", "EGFEM1P")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_Lamp5_Lhx6_Inh_Neurons_dotplot_")  
+
+    # Parvalbumin Inhibitory Neurons
+    print("Making Parvalbumin Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "SLIT2", "PPARGC1A","ADAMTS17", 
+                       "NXPH1", "KCNC2", "ERBB4", "BTBD11", "MYO5B",
+                       "TMEM132C", "ZNF804A", "PRKG1", "DPP10")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_Pvalb_Inh_Neurons_dotplot_")  
+
+    # Chandelier Inhibitory Neurons
+    print("Making Chandelier Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "CA8", "NPNT","FAM19A4", 
+                       "UNC5B", "ZNF385D-AS2", "SLC9A9", "TRPS1", "HPSE2",
+                       "DPP10-AS3", "RORA", "ZNF385D", "GULP1", "CNTN5", 
+                       "PLCXD3", "DPP10", "CALN1", "ALK", "RASSF8", "TMEM132C",
+                       "MIR4500HG", "DLGAP2", "CNTNAP3B", "SRGAP1", "LHFPL3", 
+                       "MYO16", "SDK1", "TMEM132D", "HTR1F", "TENM1", "THSD7A",
+                       "TENM4", "ANK1", "ADAMTS17", "SGCD", "ZNF536", "KCNAB1")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_Chandelier_Inh_Neurons_dotplot_")      
+            
+    # Pax6 Inhibitory Neurons
+    print("Making Pax6 Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "CXCL14", "SORCS3","ADARB2", 
+                       "SLC35F4", "MAML3", "RELN", "MYO16", "CNR1",
+                       "RBMS3", "SGCD", "PBX3", "CHRNA7", "DDR2", 
+                       "SHISA9", "B3GALT1", "CDH4", "CCK", "ZNF385D", "CCDC85A",
+                       "IL1RAPL2", "PLCXD3", "ALK", "YJEFN3")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_Pax6_Inh_Neurons_dotplot_")      
+            
+    # Sncg Inhibitory Neurons
+    print("Making Sncg Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "CXCL14", "CNR1","PRELID2", 
+                       "CNTN5", "FSTL5", "ADARB2", "CNTNAP4", "INPP4B",
+                       "CHRNA7", "RGS12", "NR2F2-AS1", "NPAS3", "ADRA1A", 
+                       "IL1RAPL2", "THSD7B", "CCK", "SORCS1", "CDH4")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_Sncg_Inh_Neurons_dotplot_")      
+
+    # SST Chod1 Inhibitory Neurons
+    print("Making SST Chod1 Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "NPY", "CRHBP","NOS1", 
+                       "SST", "TACR1", "TRPC6", "SOX6", "CCDC109B",
+                       "ARHGAP24", "IL1RAPL2", "COL24A1", "GULP1", "MPPED2", 
+                       "NXPH2", "LRP8", "LARGE", "GRIK1", "TMTC1", "RPS6KA2", 
+                       "FRMD4B", "DGKG", "SOX2-OT", "THSD4", "NELL1", "TAC1", 
+                       "NNAT")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_SST_Chod1_Inh_Neurons_dotplot_")     
+    
+    # SST Inhibitory Neurons
+    print("Making SST Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "GRIK1", "TRHDE","SST", 
+                       "NXPH1", "STXBP6", "COL25A1", "SPOCK3", "KIF26B",
+                       "SOX6", "KIAA1217", "GRIN3A", "WLS", "LOC105377567", 
+                       "CDH9", "PLCH1", "GRIK3", "ST6GALNAC5", "XKR4", "SHISA6")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_SST_Inh_Neurons_dotplot_")         
+                        
+    # VIP Inhibitory Neurons
+    print("Making VIP Inhibitory Neuron plot:")
+    feature_genes <- c("GAD1", "GAD2", "VIP", "ADARB2","GALNTL6", 
+                       "THSD7A", "RGS12", "TAC3", "SCG2", "PLD5",
+                       "ZBTB20", "LOC105373642", "PROX1", "ERBB4", "GALNT13", 
+                       "SHISA8", "DLX6-AS1", "SLC24A3", "SYNPR", "EGFEM1P", 
+                       "THSD7B")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_VIP_Inh_Neurons_dotplot_")      
+
+  # Non-neuronal cell types:    ####
+    print("Non-neuronal cell type markers:")
+    
+    # Astrocytes
+    print("Making Astrocyte plot:")
+    feature_genes <- c("SLC1A2", "ADGRV1", "GPC5", "RNF219-AS1","PITPNC1", 
+                       "DTNA", "SLC1A3", "NKAIN3", "CTNNA2", "MSI2",
+                       "RYR3", "GLIS3", "NHSL1", "COL5A3", "SLC4A4", 
+                       "RORA", "BMPR1B", "AQP4", "SFXN5", "TNIK", 
+                       "TNIK", "NEBL", "PREX2", "AHCYL2", "LRRC16A")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_Astrocyte_dotplot_")
+    
+    # Oligodendrocytes
+    print("Making Oligo plot:")
+    feature_genes <- c("ST18", "PLP1", "RNF220", "MBP","CTNNA3", 
+                       "SLC44A1", "ENPP2", "FRMD4B", "PIP4K2A", "DOCK10",
+                       "MAP7", "EDIL3", "SLC24A2", "MOBP", "KCNH8", 
+                       "TMEM144", "TTLL7", "DOCK5", "C10orf90", "ELMO1", 
+                       "SHTN1", "MAN2A1", "PLEKHH1", "PHLPP1", "MOG")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_Oligo_dotplot_")
+    
+    # OPC
+    print("Making OPC plot:")
+    feature_genes <- c("LHFPL3", "PCDH15", "TNR", "PTPRZ1","VCAN", 
+                       "LUZP2", "DSCAM", "LRRC4C", "MEGF11", "CA10",
+                       "SEMA5A", "XYLT1", "OPCML", "KCNMB2", "EPN2", 
+                       "SOX6", "SLC35F1", "MMP16", "LINC00511", "CHST11", 
+                       "NXPH1", "SMOC1", "NOVA1", "BRINP3", "DPP6")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_OPC_dotplot_")
+    
+    # Endothelial cells
+    print("Making Endothelial cell plot:")
+    feature_genes <- c("CLDN5", "FLT1", "EPAS1", "B2M","ABCB1", 
+                       "COBLL1", "ATP10A", "IFI27", "MECOM", "PODXL",
+                       "SLC2A1", "PRKCH", "VWF", "ERG", "ADGRF5", 
+                       "HLA-B", "ELOVL7", "ABCG2", "TMSB10", "UTRN", 
+                       "PECAM1", "THSD4", "ST6GALNAC3", "EBF1", "EGFL7")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_endothelial_dotplot_")
+    
+    # Microglia cells
+    print("Making Microglia plot:")
+    feature_genes <- c("C10orf11", "SRGAP2", "PLXDC2", "DOCK8","ARHGAP24", 
+                       "APBB1IP", "SFMBT2", "ST6GAL1", "SORL1", "TBXAS1",
+                       "INPP5D", "AC008697.1", "ADAM28", "CSF1R", "FYB1", 
+                       "SYNDIG1", "AOAH", "ATP8B4", "MAML3", "SLCO2B1", 
+                       "P2RY12", "ABCC4", "CX3CR1", "C3", "CD74")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_microglia_dotplot_")
+    
+    # Smooth muscle cells
+    print("Making Smooth muscle cells plot:")
+    feature_genes <- c("TAGLN", "CALD1", "ACTA2", "VIM","MYL9", 
+                       "EBF1", "RBPMS", "CRISPLD2", "PRKG1", "MCAM",
+                       "DSTN", "ADAMTS1", "ADIRF", "MYH11", "COL4A1", 
+                       "MIR143HG", "RP11-327J17.3", "PDE3A", "NOTCH3", "COL4A2", 
+                       "SORBS2", "LMOD1", "ZFHX3", "RNF152", "TIMP3")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_smooth_muscle_dotplot_")
+    
+    # Pericytes
+    print("Making Pericytes plot:")
+    feature_genes <- c("EBF1", "ITIH5", "RGS5", "DLC1","PDGFRB", 
+                       "COLEC12", "LAMA2", "EPAS1", "COBLL1", "NDUFA4L2",
+                       "CALD1", "DCN", "B2M", "EPS8", "SPARC", 
+                       "NOTCH3", "SLC6A12", "FN1", "PTH1R", "ARHGAP29", 
+                       "HIGD1B", "UTRN", "LHFP", "SLC38A11", "GNG11")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_pericytes_dotplot_")
+    
+    # Red blood cells
+    print("Making Red blood cells plot:")
+    feature_genes <- c("HBA1", "HBB", "CLDN5", "IFI27","GNG11", 
+                       "SDPR", "FLT1", "ITIH5", "RGS5", "EPAS1",
+                       "VIM", "ABCG2", "EBF1", "VWF", "ITM2A", 
+                       "RAMP2", "ADGRF5", "ATP10A", "SLC9A3R2", "ID3", 
+                       "TAGLN2", "SLC2A1", "HLA-B", "LMO2", "PODXL")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_red_blood_cells_dotplot_")
+    
+    # Peripheral immune cells
+    print("Making Peripheral immune cells plot:")
+    feature_genes <- c("PTPRC", "ARHGAP15", "IQGAP2", "AOAH","RUNX1", 
+                       "IKZF1", "DOCK8", "FYB1", "B2M", "FLI1",
+                       "SKAP1", "PIK3R5", "AKAP13", "INPP5D", "DOCK2", 
+                       "UTRN", "SRGN", "SAMSN1", "PRKCH", "TNFAIP8", 
+                       "APBB1IP", "SYTL3", "PARP8", "TNFRSF1B", "F13A1")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_peripheral_immune_dotplot_")
+    
+    # Vascular leptomeningeal cells
+    print("Making vascular leptomeningeal cells plot:")
+    feature_genes <- c("RP11-649A16.1", "COL1A2", "LAMA2", "BICC1","CEMIP", 
+                       "RP11-438E5.1", "COLEC12", "UACA", "SVIL", "TGFBR3",
+                       "ITIH5", "RP11-229P13.28", "TBX18", "DCN", "RP11-327J17.3", 
+                       "ZIC1", "FBLN1", "SLC7A11", "ADAMTS12", "CFH", 
+                       "PARD3", "ARHGAP29", "BNC2", "TPM1", "KCNK2")
+    feat_in_data <- list_features(feature_genes)
+    plot_dot_plot(feat_in_data, "_vascular_leptomeningeal_dotplot_")
+    
+    
+  # Gene expression from other sources:  ###
+    print("Plots with genes from sources other than Emani et al. 2024")
+    
+    # Plot progenitor markers
+    feat_in_data <- list_features(c("NES", "SOX2", "DCX", "NEUROD1", "CALB2"))
+    if(!is.null(feat_in_data)) {
+         plot_features(feat_in_data, "_progenitor_gene_expression_umap_") 
+    }
+    
+    # Explore known neuronal markers
+    plot_features(c("MAP2", "RBFOX3", "GRIA1"),
+                  "_neuronal_gene_expression_umap_")
+    
+    # Explore known astrocyte markers
+    plot_features(c("GFAP", "S100B", "ALDH1L1", "AQP4"),
+                  "_astrocyte_gene_expression_umap_")
+    
+    # Plot glutamatergic neurons
+    plot_features(c("SLC17A7", "SATB2", "NRGN"),
+                  "_glut_gene_expression_umap_")
+    
+    # Plot gabaergic neuron markers
+    plot_features(c("GAD1", "GAD2", "GRIP2"),
+                "_gaba_gene_expression_umap_")
+    
+    
+    # Special plots for organoids:  ####
+    if (identical(cell_type, "organoid")) {
+      # Plot known mesoderm markers
+      plot_features(c("KDR", "MESP1", "MESP2", "LEFTY2", "OSR1", "CSF1R"),
+                    "_mesoderm_gene_expression_umap_")
+      
+      # Plot mature neuronal markers
+      plot_features(c("MAP2", "RBFOX3", "NLGN1", "NRXN1", "SYP", "DLG4"),
+                    "_mature_neuron_gene_expression_umap_")
+      
+      # Plot immature neuronal markers
+      plot_features(c("DCX","TBR1", "BCL11B"),
+                    "_immature_neuron_gene_expression_umap_")
+      
+      # Commitment to neuronal fate markers
+      plot_features(c("TUBB3", "OTX2", "NEUROG2", "ASCL1"),
+                    "_early_neuron_gene_expression_umap_")
+      
+      # Plot neural progenitor markers
+      plot_features(c("NES", "SOX2", "PAX6", "NOTCH1"),
+                    "_neural_progenitor_gene_expression_umap_")
+      
+      # Plot hematopoeitic/myeloid markers
+      plot_features(c("SPI1", "RUNX1", "KIT"),
+                    "_myeloid_progenitor_gene_expression_umap_")
+    }
+  }
+} else {
+  print(paste("Tissue analyzed is blood."))
+  if (!identical(cell_type, "pbmcs")) {
+    stop(cell_type, " is not associated with blood tissue")
+  }
+  print(paste("The cell-type being analyzed is", cell_type))
+  # Make initial plot of generic blood cell-type specific genes
+  plot_features(c("CD68", "S100A12", "CD1C", "BATF3", "CD79A", "MS4A1", "CD3D",
+                  "GNLY", "NKG7", "PPBP", "HBB", "HBA2", "CD34", "PROM1", "KIT"),
+                "_general_gene_expression_umap_")
+  plot_features(c("CD14", "LYZ", "FCGR3A", "MS4A7", "FCER1A", "CST3", "IL3RA",
+                  "GZMB", "SERPINF1", "IL7R", "CCR7", "CD8A", "SELL",
+                  "CREM", "CD69"), "_subtype_gene_expression_umap_")
+  feat_in_data <- list_features(c("CD68", "S100A12", "CD14", "LYZ", "FCGR3A",
+                  "MS4A7", "CD1C", "BATF3", "FCER1A", "CST3", "IL3RA", "GZMB",
+                  "SERPINF1", "CD79A", "MS4A1", "CD3D", "IL7R", "CCR7", "CD8A",
+                  "SELL", "CREM", "CD69", "GNLY", "NKG7", "PPBP", "HBB", "HBA2",
+                  "CD34", "PROM1", "KIT", "CREB3L1",  "SMARCA1", "ZFP9", 
+                  "SNCAIP", "SUPT3H", "NFIL13"))
+  plot_dot_plot(feat_in_data, "_general_gene_expression_cluster_dotplot_")
+}
+```
+

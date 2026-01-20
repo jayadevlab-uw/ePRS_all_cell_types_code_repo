@@ -1,0 +1,524 @@
+---
+title: "18_pseudobulk_DEG_model_visualization_v2"
+author: "Katie Prater and Kevin Green"
+date: "9/16/2021"
+output: 
+  html_document:
+    df_print: paged
+params:
+  container: ""
+---
+
+```{r setup, cache=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(Seurat)
+library(Matrix)
+library(scater)
+library(cowplot)
+library(Matrix.utils)
+library(edgeR)
+library(magrittr)
+library(reshape2)
+library(S4Vectors)
+library(SingleCellExperiment)
+library(apeglm)
+library(png)
+library(DESeq2)
+library(RColorBrewer)
+library(data.table)
+library(patchwork)
+library(variancePartition)
+library(stats)
+```
+
+# Jayadev Lab snRNAseq Pipeline
+
+## Detection of Differential genes by pseudobulk analysis
+
+### R Markdown note:
+This is an R Markdown document. When you click the **Knit** button a document
+will be generated that includes both content as well as the output of any
+embedded R code chunks within the document.
+
+## Set the dataset with cluster identities.
+# You MUST edit this for your dataset to run properly!!!!
+```{r Setup}
+# Previous data file name: (give the name for the appopriate RDS/Rdata file)
+start_data <- "QCd_norm_clustered_labelled_ws_ePRS_23s_uns_ADNChigh_20240112_noSoupx_harm.rdata"
+
+# Rdata file names and resolutions
+# QCd_norm_clustered_labelled_ws_ePRS_23s_uns_ADNChigh_20240112_anch.rdata res 0.2
+# QCd_norm_clustered_labelled_ws_ePRS_23s_uns_ADNChigh_20240112_noSoupx_anch.rdata res 0.15
+# QCd_norm_clustered_labelled_ws_ePRS_23s_uns_ADNChigh_20240112_harm.rdata res 0.1
+# QCd_norm_clustered_labelled_ws_ePRS_23s_uns_ADNChigh_20240112_noSoupx_harm.rdata res 0.1 19 clusters
+
+# Change output path if necessary, otherwise leave NULL
+change_output_path <- NULL
+
+# Set the sample ID meta-data variable name
+ID <- "Sample_ID"
+
+# Change the metadata csv file, if necessary
+change_csv <- NULL #"eprs_metadata_updated20220302.csv"
+
+# Set variables from metadata on which to perform DEG (must match variable names
+# in metadata exactly). All other variables given will be regressed out before
+# testing each variable. For this reason, use caution when adding many when the
+# sample size is small.
+meta_vars <- c("ePRS", "age_at_death", "APOE_genoytpe", "sex", "seq_batch")
+
+# Set the reference value of the each meta_var (e.g. "Ctrl")
+# Set reference values for numeric variables to NA
+ref <- c("Low", NA, "e3e3", "Male", "1")
+
+# Set any interaction terms you want to examine. Provide the metadata variable
+# names, separated by a colon (e.g. "Study_Designation:APOE4_Allele"). 
+# Otherwise, leave NULL.
+interactions <- c("ePRS:age_at_death", "ePRS:sex")
+
+# Fixed Effects - provide the variable names that are not categorical
+fix_eff_vars <- c("age_at_death")
+
+# Random Effects - provide the variable names that are categorical
+rand_eff_vars <- c("ePRS", "APOE_genoytpe", "sex", "seq_batch")
+
+# Set a model name (for outputs)
+model_name <- "ePRS_age_sex_ints"
+
+# Set cluster names that need to be removed from analysis
+remove <- NULL #c(11, 12)
+  
+# Input any metadata variables for discrete groups that are set as integers
+# (e.g. mutation status = 0 or 1). Otherwise, NULL
+meta_factors <- c("seq_batch")
+
+# Choose the minimum fold change of a gene, in either group being tested, for
+# the gene to be tested. Fold change is expressed as log base 2.
+# (0.585 ~ 1.5 increase, 0.322 ~ 1.25 increase)
+log2_threshold <- 0.585
+
+# Input which colors to use in the plots. Input as a list
+# (e.g. c("gray", "salmon")) or a color palette (e.g. brewer.pal(3, "Paired"))
+colors <- c("purple", "teal")
+
+# Which method for GSEA do you wish to use? Use "wald" for the Wald statistic,
+# "lfc" for the shrunken log2 fold change, "-log10p" for the
+# -log10(p-value), or NULL to perform no GSEA.
+method <- "wald"
+
+# Resolution chosen from previous clustering to use to label clusters:
+change_resolution <- "0.1"
+
+# Set which clusters should be combined. If no clusters are to be combined, set
+# to NULL. 
+# IF NOT NULL, THIS WILL RUN ONLY THE COMBINED CLUSTERS
+combined <- c(0:19)
+#__________________**DO NOT EDIT BELOW THIS LINE**___________________________
+```
+
+## Load in the data you specified:
+```{r Load_Data}
+# Document your code:
+print(paste("This is when this code was started:", Sys.time()))
+
+# Print which container is being used
+if (identical(params$container, "")) {
+  stop("The container number must be documented before rendering.
+       params= list(container = ###)")
+}
+print(paste("Container number", params$container, "was used"))
+
+# Load the normalized/batch corrected Seurat object saved before
+print(paste('Loading data', start_data, sep = " "))
+load(paste0("../data/r_files/", start_data))
+
+# Print container package versions, if changed from previous
+if (!identical(params$container, prev_container)) {
+  print("This code was run using:")
+  print(sessionInfo())
+  prev_container <- params$container
+}
+rm(params)
+
+# Change permissions to open for files created
+Sys.umask("007")
+
+# Change output path if a new one is provided.
+if (!is.null(change_output_path)) {
+  print("Changing output path")
+  outpath <- change_output_path
+}
+
+# Change metadata csv if a new one is provided.
+if (!is.null(change_csv)) {
+  print("Changing metadata csv")
+  ss_csv <- change_csv
+}
+
+# Ensure resolution to be used is set properly.
+if (!is.null(change_resolution)) {
+  chose_resolution <- change_resolution
+  
+  # First ensure that the idents are set to the resolution of clusters that you
+  # want. Remake resolution name to ensure it's accurate:
+  res_name <- paste0(assay, "_snn_res.", chose_resolution)
+  
+  Idents(object = ss_data_norm) <- res_name
+}
+
+# Check if meta.data variables match gene names
+meta_data <- colnames(ss_data_norm@meta.data)
+all_genes <- row.names(ss_data_norm@assays$RNA@counts)
+while (any(meta_data %in% all_genes)) {
+  change <- meta_data[meta_data %in% all_genes][1]
+  warning(paste0("Changing the name of ", change, " metadata column to ",
+                 change, "_status"))
+  ss_data_norm@meta.data[[paste0(change, "_status")]] <- ss_data_norm@meta.data[[change]]
+  ss_data_norm@meta.data[[change]] <- NULL
+  meta_data <- colnames(ss_data_norm@meta.data)
+}
+
+# Change the active assay to the assay to be evaluated for DEG
+DefaultAssay(ss_data_norm) <- "RNA"
+```
+
+```{r Set_Directories}
+# Ensure paths are set for code:
+if (file.exists(outpath)) {
+  cat("Output directory path works!")
+} else {
+  cat("Output directory does not exist - creating")
+  dir.create(outpath)
+}
+
+# Number of participants/samples to process:
+numsubs <- length(samples)
+print(paste("Processing", numsubs, "samples", sep = " "))
+
+# Documentation:
+print(paste("This is where the project is:", normalizePath(projdir)))
+print(paste("This is where the sample files are:", normalizePath(sample_dir)))
+print(paste("This is where the data files will be saved:",
+             normalizePath(outpath)))
+
+# Set the file paths to DEG folder:
+DEG_path <- paste0(outpath, "/DEG/")
+
+# Confirm sample directory exists.
+if (file.exists(DEG_path)) {
+  cat("DEG directory path works!\n")
+} else {
+  cat("DEG directory does not exist - creating\n")
+  dir.create(DEG_path)
+}
+```
+
+```{r aggregate_single_cells}
+change_path <- function (path) {
+  # Confirm sample directory exists.
+  if (file.exists(path)) {
+    cat(path, " directory path works!\n")
+  } else {
+    cat(path, " directory does not exist - creating\n")
+    dir.create(path)
+  }
+  return(path)
+}
+
+bulk_path <- change_path(paste0(outpath, "/DEG/pseudobulk_by_group/"))
+plots_path <- change_path(paste0(bulk_path, "plots/"))
+
+# Set random seed for reproducibility
+set.seed(42)
+
+# Remove any unwanted clusters
+if (!is.null(remove)) {
+  ss_data_norm <- SubsetData(ss_data_norm, ident.remove = remove)
+}
+
+# Extract raw counts and metadata to create SingleCellExperiment object
+counts <- ss_data_norm@assays$RNA@counts
+metadata <- ss_data_norm@meta.data
+
+# Check which variables from your regression are already in your metadata
+to_remove <- meta_vars %in% colnames(metadata)
+
+# Remove variables from metadata that should be confirmed with new csv
+metadata <- select(metadata,-(meta_vars[to_remove]))
+
+# Set the minimum number of nuclei that must express a gene for the gene to be
+# included in DEG analysis
+min_nuclei <- min(table(Idents(ss_data_norm))[table(Idents(ss_data_norm)) > 0])
+print(paste("A minimum of", toString(min_nuclei),
+      "cells/nuclei must express a gene for it to be analyzed"))
+
+# Set up metadata as desired for aggregation and DE analysis
+if (!is.null(combined)) {
+  # Combine clusters if necessary
+  metadata$cluster_id[!is.null(metadata[1])] <-
+    as.vector(paste(combined, collapse = "-"))
+} else {
+  metadata$cluster_id <- factor(ss_data_norm@active.ident)
+}
+rm(ss_data_norm)
+
+# Create single cell experiment object
+sce <- SingleCellExperiment(assays = list(counts = counts), 
+                            colData = metadata)
+
+# Identify groups for aggregation of counts
+groups <- colData(sce)[, c("cluster_id", ID)]
+
+if (!is.null(combined)) {
+  # Combine clusters if necessary
+  kids <- c(paste(combined, collapse = "-"))
+} else {
+  # Named vector of cluster names
+  kids <- purrr::set_names(levels(sce$cluster_id))
+}
+
+# Named vector of sample names
+sids <- purrr::set_names(levels(as.factor(sce[[ID]])))
+
+# Turn named vector into a numeric vector of number of cells per sample
+n_cells <- as.numeric(table(sce[[ID]]))
+
+# Determine how to reorder the samples (rows) of the metadata to match the
+# order of sample names in sids vector
+reorder <- match(sids, sce[[ID]])
+
+# Create the sample level metadata by combining the reordered metadata with
+# the number of cells corresponding to each sample.
+metadata_df <- 
+  data.frame(colData(sce)[reorder, ], n_cells, row.names = NULL) %>%
+    dplyr::select(-"cluster_id")
+csv_metadata <- read.csv(paste0(datapath, ss_csv))
+metadata_df <- cbind(metadata_df,
+                     csv_metadata[,!(colnames(csv_metadata) %in% 
+                                       colnames(metadata_df))])
+
+# Remove lowly expressed genes which are expressed in less than number of cells
+# in the smallest cluster
+sce <- sce[rowSums(counts(sce) > 1) >= min_nuclei, ]
+print(paste(nrow(counts(sce)), "genes will be tested"))
+
+# Aggregate across cluster-sample groups
+aggregate <- aggregate.Matrix(t(counts(sce)), 
+                              groupings = groups, fun = "sum") 
+
+# Not every cluster is present in all samples; create a vector that represents
+# how to split samples
+splitf <- sapply(stringr::str_split(rownames(aggregate),
+                                    pattern = "_",
+                                    n = 2), `[`, 1)
+
+# Turn into a list and split the list into components for each cluster and
+# transform, so rows are genes and columns are samples and make rownames as
+# the sample IDs
+aggregate <- split.data.frame(aggregate, factor(splitf)) %>%
+             lapply(function(u)
+                    set_colnames(t(u),
+                                 stringr::str_extract(rownames(u),
+                                                    "(?<=_)[:alnum:]+")))
+
+# Print out the table of cells in each cluster-sample group
+options(width = 100)
+print(table(sce$cluster_id, sce[[ID]]))
+
+# Get sample names for each of the cell type clusters
+# prepare data.frame for plotting
+get_sample_ids <- function(x){
+                    aggregate[[x]] %>% colnames()
+}
+de_samples <- map(1:length(kids), get_sample_ids) %>% unlist()
+
+# Get cluster IDs for each of the samples
+samples_list <- map(1:length(kids), get_sample_ids)
+get_cluster_ids <- function(x){
+                     rep(names(aggregate)[x], each = length(samples_list[[x]]))
+}
+de_cluster_ids <- map(1:length(kids), get_cluster_ids) %>% unlist()
+
+# Create a data frame with the sample IDs, cluster IDs and conditions
+gg_df <- data.frame(cluster_id = de_cluster_ids,
+                    sample_id = de_samples) # as.integer(de_samples)
+names(gg_df)[2] <- ID
+gg_df <- left_join(gg_df, metadata_df[, c(ID, meta_vars)])
+metadata <- gg_df %>% dplyr::select(cluster_id, ID, all_of(meta_vars))
+metadata <- metadata[ , colSums(is.na(metadata)) == 0]
+ref <- ref[meta_vars %in% colnames(metadata)]
+meta_vars <- meta_vars[meta_vars %in% colnames(metadata)]
+print(metadata)
+
+# Convert integer values to factors
+for (group in meta_factors) {
+  if (typeof(metadata[[group]]) == "integer") {
+    for (sample in 1:length(sids)) {
+      metadata[[group]][[sample]] <-
+        toString(metadata[[group]][[sample]])
+    }
+  }
+}
+
+for (meta_var in 1:length(ref)) {
+  if(!is.numeric(metadata[[meta_vars[meta_var]]])) {
+    metadata[[meta_vars[meta_var]]] <- as.factor(metadata[[meta_vars[meta_var]]])
+    metadata[[meta_vars[meta_var]]] <- relevel(metadata[[meta_vars[meta_var]]],
+                                               ref = ref[meta_var])
+  }
+}
+```
+
+``` {r DESeq2_DEG}
+# Generate vector of cluster IDs
+clusters <- unique(metadata$cluster_id)
+
+# Perform DEG analysis between given metadata variables for each cluster
+for (cluster in clusters) {
+  # Print which cluster is being worked on
+  print(paste("Determining DEGs for", cluster))
+  
+  bulk_path <- change_path(paste0(outpath, "/DEG/pseudobulk_model/"))
+  plots_path <- change_path(paste0(bulk_path, "plots/"))
+
+  # Subset the metadata
+  cluster_metadata <- metadata[which(metadata$cluster_id == cluster), ]
+  
+  # Assign the rownames of the metadata to be the sample IDs
+  rownames(cluster_metadata) <- cluster_metadata[[ID]]
+
+  # Subset the counts to only the cluster
+  sub_counts <- aggregate[[cluster]]
+  cluster_counts <- as.data.frame(sub_counts[, which(colnames(sub_counts) %in%
+                                                rownames(cluster_metadata))])
+
+  # Check that all of the row names of the metadata are the same and in the same
+  # order as the column names of the counts in order to use as input to DESeq2
+  all(rownames(cluster_metadata) == colnames(cluster_counts))
+  
+  # Set the design of the DEG to test all variables given
+  if (!is.null(interactions)) {
+    design_exp <- paste("~ ", str_c(meta_vars, collapse = " + "), " + ",
+                        str_c(interactions, collapse = " + "))
+  } else {
+    design_exp <- paste("~ ", str_c(meta_vars, collapse = " + "))
+  }
+  
+  for (meta_var in meta_vars) {
+    # Order the data by metadata group for visualization
+    cluster_metadata <-
+      cluster_metadata[order(as.vector(cluster_metadata[[meta_var]]),
+                                       cluster_metadata[[ID]]),]
+    
+    # Center and scale any numeric variables (recommended by DESeq2)
+    for (meta_var in meta_vars) {
+      if(is.numeric(cluster_metadata[[meta_var]])) {
+        cluster_metadata[[meta_var]] <- scale(cluster_metadata[[meta_var]])
+      }
+    }
+    
+    # Remove any comparisons that cause conflicts in DESeq2 analysis
+    design <- model.matrix(eval(str2expression(design_exp)), cluster_metadata)
+    while(qr(design)$rank < ncol(design)) {
+      if (any(colSums(design) == 0)) {
+        design <- design[, colSums(design) != 0]
+      } else {
+        rank_removed <- sapply(1:ncol(design), function (x) qr(design[,-x])$rank)
+        design <- subset(design,
+                         select = -max(which(rank_removed == max(rank_removed))))
+      }
+    }
+    
+    # Create DESeq object for DEG analysis
+    DEG_data <- DESeqDataSetFromMatrix(cluster_counts, 
+                                       colData = cluster_metadata, 
+                                       design = design)
+  }
+
+  # Run DESeq2 differential expression analysis
+  DEG_data <- DESeq2::DESeq(DEG_data)
+  
+  # Get names of the effects tested
+  names <- resultsNames(DEG_data)[-1]
+  
+  for (effect in names) {
+    # Print which effect is being worked on
+    print(paste("Determining DEGs for", effect))
+    
+    # Reset bulk directories
+    bulk_path <- paste0(outpath, "/DEG/pseudobulk_model/")
+    
+    # Create list of differential expression for all genes. This method
+    # returns the Wald "stat" value for gsea analysis
+    results <- results(DEG_data, name = effect, tidy = TRUE)
+    
+    hist_plot <- ggplot(results, aes(x = pvalue)) + 
+                   geom_histogram(color="black", fill="white") +
+                   theme(panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(),
+                         panel.background = element_blank(),
+                         axis.line = element_line(colour = "gray")) +
+                   xlim(-0.05, 1.05)
+    hist_plot <- hist_plot + ggtitle(effect)
+    print(hist_plot)
+    ggsave(filename = paste0(plots_path, "DEG_padj_hist_smallest", cluster, "_",
+                             effect, "_res.",
+                             chose_resolution, suffix, ".png"),
+               height = 7, width = 7, plot = hist_plot)
+  }
+}
+```
+
+```{r variance partitions}
+# Variance partitions for the whole dataset
+bulk_path <- change_path(paste0(outpath, "/DEG/pseudobulk_model/"))
+varplots_path <- change_path(paste0(bulk_path, "variance_partitions/"))
+
+# Create DESeq object for DEG analysis
+DEG_data <- DESeqDataSetFromMatrix(cluster_counts, 
+                                   colData = cluster_metadata,
+                                   design = design)
+
+DEG_data <- estimateSizeFactors(DEG_data)
+quantLog <- log2( fpm( DEG_data ) + 1)
+
+# Edit the formula for regression for the variance partition
+rand_eff_vars <- rand_eff_vars[rand_eff_vars %in% colnames(metadata)]
+fix_eff_vars <- fix_eff_vars[fix_eff_vars %in% colnames(metadata)]
+if (!is.null(rand_eff_vars)) {
+  if(!is.null(interactions)) {
+    formula_des <- paste("~ ", str_c(fix_eff_vars, collapse = " + "), " + (1|",
+                        str_c(rand_eff_vars, collapse = ") + (1|"), ")", " + ",
+                       str_c(interactions, collapse = " + "))
+  }else{
+    formula_des <- paste("~ ", str_c(fix_eff_vars, collapse = " + "), " + (1|",
+                        str_c(rand_eff_vars, collapse = ") + (1|"), ")")
+  }
+} else {
+  if (!is.null(interactions)) {
+    formula_des <- paste("~", str_c(fix_eff_vars, collapse = " + "), " + ", 
+                       str_c(interactions, collapse = " + "))
+  }else{
+    formula_des <- paste("~", str_c(fix_eff_vars, collapse = " + "))
+  }
+}
+
+
+
+# Make the variance partitions
+varPart <- fitExtractVarPartModel(quantLog, formula_des, cluster_metadata)
+vp <- sortCols(varPart)
+vplot <- plotVarPart(vp)
+print(vplot)
+ggsave(filename = paste0(varplots_path, "Variance_partitions_", model_name, "_res.",
+                             chose_resolution, suffix, ".png"),
+               height = 7, width = 7, plot = vplot)
+vplot_jitter <- plotVarPart(vp) + geom_jitter()
+ggsave(filename = paste0(varplots_path, "Variance_partitions_jittered_",
+                             model_name, "_res.",
+                             chose_resolution, suffix, ".png"),
+               height = 7, width = 7, plot = vplot_jitter)
+
+
+```

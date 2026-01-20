@@ -1,0 +1,393 @@
+---
+title: "08_snRNAseq_harmony_v1"
+author: "Katie Prater and Kevin Green"
+date: "6/24/2020"
+output: 
+  html_document:
+    df_print: paged
+params:
+  container: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+library(harmony)
+```
+# Jayadev Lab snRNAseq Pipeline
+
+### Removal of unwanted batch/sample effects, normalization, and Harmony
+### reduction for cleanup of data
+## (but no regression for population variables of no interest - those come
+## afterward on the whole dataset)
+
+### R Markdown note:
+This is an R Markdown document. When you click the **Knit** button a document
+will be generated that includes both content as well as the output of any
+embedded R code chunks within the document.
+
+## Set the dataset that needs to be normalized.
+# You MUST edit this for your dataset to run properly!!!!
+```{r Setup}
+# Name of the Rdata file to load in:
+start_data <- "QCd_norm_harmony_ws_harm_44s_uns_20250130_rm813_13to16_2627.rdata"
+
+# Define the number of genes you want after variable gene detection:
+nfeatures <- 5000
+
+# List the sample-level variables from the meta.data that should be 
+# regressed out. These are variables that have a different value for each 
+# nucleus only (e.g. percent.mito). No population/group-level variables here.
+unwanted <- c("percent.mito")
+
+# Change output path if necessary, otherwise leave NULL
+change_output_path <- NULL #"../output/output_ePRS_44s_uns_20250130/rm_8_13/rm_13to16/"
+
+# Change the suffix, if necessary
+change_suffix <- NULL #"_ePRS_23s_uns_ADNChigh_20240503_harm"
+
+#__________________**DO NOT EDIT BELOW THIS LINE**___________________________
+```
+
+### Load in the data you specified:
+```{r Load_Data}
+# Document your code:
+print(paste("This is when this code was started:", Sys.time()))
+
+# Print which container is being used
+if (identical(params$container, "")) {
+  stop("The container number must be documented before rendering.
+       params= list(container = ###)")
+}
+print(paste("Container number", params$container, "was used"))
+
+# Load the normalized Seurat object saved before
+print(paste('Loading data', start_data, sep = " "))
+load(paste0("../data/r_files/", start_data))
+
+# Print container package versions, if changed from previous
+if (!identical(params$container, prev_container)) {
+  print("This code was run using:")
+  print(sessionInfo())
+  prev_container <- params$container
+}
+rm(params)
+Sys.umask("007")
+
+# Create change paths function
+change_path <- function (path) {
+  # Confirm sample directory exists.
+  if (file.exists(path)) {
+    cat(path, " directory path works!\n")
+  } else {
+    cat(path, " directory does not exist - creating\n")
+    dir.create(path)
+  }
+  return(path)
+}
+
+# Changes suffix if needed
+if (!is.null(change_suffix)) {
+  suffix <- change_suffix
+}
+
+# Changes output path if needed
+if (!is.null(change_output_path)) {
+  outpath <- change_path(change_output_path)
+}
+
+# Create UMAPs folder
+umaps_path <- file.path(outpath, "umaps", fsep = "/")
+if (file.exists(umaps_path)) {
+  cat("umaps directory path works!")
+} else {
+  cat("umaps directory does not exist - creating")
+  dir.create(umaps_path)
+}
+
+if (exists("ss_data_norm")) {
+  ss_data_scrubbed <- ss_data_norm
+  rm(ss_data_norm)
+}
+
+set.seed(42)
+```
+
+```{r Set_Directories}
+# Number of participants/samples to process:
+numsubs <- length(samples)
+print(paste("Processing", numsubs, "samples", sep = " "))
+
+# Documentation:
+print(paste("This is where the project is:", normalizePath(projdir)))
+print(paste("This is where the sample files are:", normalizePath(sample_dir)))
+print(paste("This is where the data files will be saved:",
+             normalizePath(outpath)))
+```
+
+```{r data_metrics}
+# Determine total number of genes and total number of cells and writes info into
+# a csv file
+totals <- dim(ss_data_scrubbed)
+names(totals) <- c("genes", "cells")
+print(totals)
+write.csv(totals,
+          paste0(metrics_path, "postQC_total_genes&cells", suffix, ".csv"))
+
+# Gets number of nuclei per sample
+num_cells <- table(ss_data_scrubbed$orig.ident) 
+
+# Gets average # of genes per cell
+avg_gene <- rbind(round(by(ss_data_scrubbed@meta.data$nFeature_RNA,
+                           ss_data_scrubbed@active.ident, mean)))
+# Gets average # of UMIs per cell
+avg_umi <- rbind(round(by(ss_data_scrubbed@meta.data$nCount_RNA,
+                          ss_data_scrubbed@active.ident, mean)))
+# Combines and prints above metrics
+metrics <- rbind(num_cells, avg_gene, avg_umi)
+row.names(metrics) <- c("Cells", "Avg genes per cell", "Avg UMIs per cell")
+print(metrics)
+write.csv(metrics,
+          paste0(metrics_path, "postQC_metrics", suffix, ".csv"))
+
+rm(totals, num_cells, avg_gene, avg_umi, metrics)
+```
+
+## Make umap plots for each sample prior to normalization/Harmony to have a
+## comparison for afterward.
+```{r Before_UMAPS}
+if (!file.exists(paste0(outpath, "/umaps/preSCT/umaps_all_samples_preSCT",
+                        suffix, ".png"))) {
+  # Set default assay back to RNA if other assays exist.
+  DefaultAssay(object = ss_data_scrubbed) <- "RNA"
+  
+  # Run PCA and UMAP on data
+  ss_data_pca <- FindVariableFeatures(ss_data_scrubbed, nfeatures = 5000)
+  ss_data_pca <- ScaleData(ss_data_pca)
+  ss_data_pca <- RunPCA(object = ss_data_pca, verbose = FALSE)
+  ss_data_pca <- RunUMAP(object = ss_data_pca, dims = 1:30)
+  
+  # Create UMAPs folder
+  umaps_path <- file.path(outpath, "umaps/preSCT/", fsep = "/")
+  if (file.exists(umaps_path)) {
+    cat("Output directory path works!")
+  } else {
+    cat("Output directory does not exist - creating")
+    dir.create(umaps_path)
+  }
+  
+  # Make a standard UMAP plot of the clusters by sample before SCTransform
+  # Get dataset to use ggplot instead of Seurat functions.
+  class_umap_data <- FetchData(ss_data_pca,
+                               vars = c("ident", "UMAP_1", "UMAP_2"))
+  list_idents <- unique(class_umap_data$ident)
+  
+  # Make UMAP overlay of each sample on top of the overall dataset
+  for (sample in 1:length(list_idents)) {
+    subset_sample_data <- class_umap_data %>% filter(ident == list_idents[sample])
+    plotname <- paste0("plot_", sample)
+    assign(plotname, ggplot(data = class_umap_data, aes(x = UMAP_1, y = UMAP_2)) + 
+      geom_point(alpha = 0.25, size = 0.01, colour = "grey") + 
+      geom_point(data = subset_sample_data, alpha = 0.25, size = 0.01,
+                 colour = "blue") + 
+      theme_bw() + 
+      theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+    )
+    ggsave(filename = paste0(umaps_path, "umaps_preSCT_sample_", sample,  suffix,
+                             ".png"),
+         height = 12, width = 12, plot = get(plotname))
+  }
+  
+  # Combine plots into one image object and save it
+  plot_name <- rep(NA, length(list_idents))
+  for (plots in 1:length(list_idents)) {
+    plot_name[plots] <- paste0("plot_", plots)
+  }
+  plots <- paste(plot_name[1:length(list_idents)], collapse = " + ")
+  all_plots <- eval(str2expression(plots))
+  ggsave(filename = paste0(umaps_path, "umaps_all_samples_preSCT", suffix, ".png"),
+         height = 12, width = 12, plot = all_plots)
+  
+  # Clean up variables and objects
+  objs <- ls()
+  objects_to_remove <- c(grep('plot_', objs, value = TRUE))
+  rm(list = objects_to_remove)
+  rm(ss_data_pca, class_umap_data, list_idents, subset_sample_data, sample,
+     plotname, plot_name, plots, all_plots)
+}
+```
+
+## We run a regularized negative binomial regression on all samples using the 
+## given number of variable features.
+```{r normalize, warning=FALSE}
+# Create normalization function
+normalize <- function (data) {
+    data <- SCTransform(data, 
+                        variable.features.n = nfeatures,
+                        do.scale = FALSE,
+                        do.center = FALSE,
+                        conserve.memory = TRUE,
+                        return.only.var.genes = FALSE,
+                        vars.to.regress = unwanted,
+                        verbose = FALSE)
+  }
+
+# Split data so that we can normalize each sample individually
+ss_data_split <- SplitObject(ss_data_scrubbed, split.by = 'orig.ident')
+
+# Normalize each sample
+ss_data_norm_unmerged <- lapply(ss_data_split, normalize)
+
+integration_features <- SelectIntegrationFeatures(object.list = ss_data_norm_unmerged, 
+                                      nfeatures = nfeatures)
+
+# Merge the samples back together for future processing
+ss_data_norm <- merge(ss_data_norm_unmerged[[1]],
+                      ss_data_norm_unmerged[2:length(ss_data_norm_unmerged)],
+                      merge.data=TRUE)
+
+# Ensure that the variable features match what SCT originally found.
+VariableFeatures(object = ss_data_norm) <- integration_features
+
+# Remove unneeded objects
+rm(ss_data_scrubbed, ss_data_split, ss_data_norm_unmerged, integration_features)
+```
+
+## Make a couple of quick umap plots to confirm that the batch correction worked well.
+```{r UMAP_plot}
+# Set default assay
+DefaultAssay(ss_data_norm) <- "SCT"
+
+# Run PCA and UMAP to get the data
+ss_data_norm <- RunPCA(object = ss_data_norm, verbose = FALSE, npcs = 50)
+ss_data_norm <- RunHarmony(ss_data_norm, group.by.vars = "orig.ident",
+                           assay.use = "SCT")
+ss_data_norm <- RunUMAP(ss_data_norm, reduction = "harmony", dims = 1:30)
+
+# Create UMAPs folder
+umaps_path <- file.path(outpath, "umaps/postSCT/", fsep = "/")
+if (file.exists(umaps_path)) {
+  cat("Output directory path works!")
+} else {
+  cat("Output directory does not exist - creating")
+  dir.create(umaps_path)
+}
+
+# Determine the number of PCs required to obtain a change in standard deviation
+# less than 0.1, for which 90% of the variance is accounted, and 95% of the 
+# variance.
+variances <- Stdev(ss_data_norm@reductions$"pca")^2
+variance <- sum(variances)
+variances <- variances/variance
+
+print(paste("The variance accounted for by all prinicple components is:",
+            variance, sep = " "))
+print(paste("The number of prinicple components needed to account for greater", 
+            "than 90% of the variance is:", min(which(cumsum(variances) > .90))))
+print(paste("The number of prinicple components needed to account for greater", 
+            "than 95% of the variance is:", min(which(cumsum(variances) > .95))))
+PCs <- min(which(abs(diff(variances)) < .1))
+print(paste("The number of prinicple components where the difference is small:",
+            PCs))
+
+# Generate an elbow plot for the harmony   
+plot1 <- ElbowPlot(ss_data_norm, ndims = 50, reduction = "pca")
+print(plot1)
+ggsave(paste0(umaps_path, "PC_elbow_plot_Post-QC_harmony", suffix, ".png"))
+
+# Visualize the PCs as top 10 genes
+print(ss_data_norm[["pca"]], dims = 1:5, nfeatures = 10)
+
+# Visualize the top 10 PCs with their genes
+plot1 <- VizDimLoadings(ss_data_norm, dims = 1:10, reduction = "pca")
+print(plot1)
+ggsave(paste0(umaps_path, "PC_loadings_plot_Post-QC_harmony", suffix, ".svg"))
+
+ss_data_norm <- RunUMAP(ss_data_norm, reduction = "harmony", dims = 1:30)
+
+# Next, switch the identity class of all cells to reflect sample ID
+Idents(ss_data_norm) <- "orig.ident"
+
+# Make a standard UMAP plot of the clusters
+plot2 <- DimPlot(object = ss_data_norm,
+                     pt.size = 1,
+                     label = FALSE,
+                     label.size = 10)
+plot2[[1]]$layers[[1]]$aes_params$alpha = .2
+print(plot2)
+ggsave(filename = paste0(umaps_path, "harmony_samples_postQC", suffix,
+                         ".png"), height = 8, width = 8, plot = plot2)
+    
+# Make a standard UMAP plot of the clusters by sample
+plot3 <- DimPlot(object = ss_data_norm,
+                     split.by = "orig.ident",
+                     pt.size = 1,
+                     label = FALSE,
+                     label.size = 10,
+                     ncol = 5)
+print(plot3)
+ggsave(filename = paste0(umaps_path, "harmony_samples_split_postQC",
+                         suffix, ".png"),
+       height = 12, width = 12, plot = plot3)
+
+# Make a standard UMAP plot of the clusters by sample after SCTransform
+# Get dataset to use ggplot instead of Seurat functions.
+class_umap_data <- FetchData(ss_data_norm,
+                             vars = c("ident", "UMAP_1", "UMAP_2"))
+list_idents <- unique(class_umap_data$ident)
+
+# Make UMAP overlay of each sample on top of the overall dataset
+for (sample in 1:length(list_idents)) {
+  subset_sample_data <- class_umap_data %>% filter(ident == list_idents[sample])
+  plotname <- paste0("plot_", sample)
+  assign(plotname, ggplot(data = class_umap_data, aes(x = UMAP_1, y = UMAP_2)) + 
+    geom_point(alpha = 0.25, size = 0.01, colour = "grey") + 
+    geom_point(data = subset_sample_data, alpha = 0.25, size = 0.01,
+               colour = "blue") + 
+    theme_bw() + 
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(colour = "black"))
+  )
+  ggsave(filename = paste0(umaps_path, "umaps_postSCT_harmony_sample_", sample,
+                           suffix, ".png"),
+       height = 12, width = 12, plot = get(plotname))
+}
+
+# Combine plots into one image object and save it
+plot_name <- rep(NA, length(list_idents))
+for (plots in 1:length(list_idents)) {
+  plot_name[plots] <- paste0("plot_", plots)
+}
+plots <- paste(plot_name[1:length(list_idents)], collapse = " + ")
+all_plots <- eval(str2expression(plots))
+ggsave(filename = paste0(umaps_path, "umaps_all_samples_postSCT_harmony", 
+                         suffix, ".png"),
+       height = 12, width = 12, plot = all_plots)
+
+# Clean up variables and objects
+objs <- ls()
+objects_to_remove <- c(grep('plot_', objs, value = TRUE))
+rm(list = objects_to_remove)
+rm(ss_data_pca, class_umap_data, list_idents, subset_sample_data, sample,
+   plotname, plot_name, plots, all_plots)
+
+# Save umaps_path variable as path to generic umaps folder for future use.
+umaps_path <- file.path(outpath, "umaps/", fsep = "/")
+```
+
+## Save the data files.
+```{r Save_Files}
+# Remove objects that are no longer needed
+rm(sample_sub, use_reference, reference_samples, reference_samples2, params,
+   nfeatures, plot1, plot2, plot3, unwanted, variance, variances, start_data,
+   change_output_path, change_suffix)
+
+# Save workspace image if needed to revisit
+save.image(file = paste0(rfiles_path, "QCd_norm_harmony_ws", suffix, ".rdata"),
+           compress = TRUE)
+```
